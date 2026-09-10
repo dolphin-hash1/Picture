@@ -1,0 +1,5 @@
+customtkinter>=5.2,<6
+Pillow>=10,<12
+websocket-client>=1.8,<2
+cryptography>=42,<46
+pywin32>=306; platform_system == "Windows"
