@@ -44,28 +44,78 @@ def encrypt_and_save_image(image_bytes, node_id, index):
         f.write(encrypted_data)
     return file_name
 
-def execute_generation_task(user_prompt, msg_queue):
+def free_vram():
+    """
+    手动/外部调用：释放 ComfyUI 和 LM Studio 的所有显存。
+    1. 向 ComfyUI 发送 POST /free (卸载模型并清空 PyTorch 缓存)
+    2. 向 LM Studio 触发 unload API 或 lms unload --all
+    """
+    results = []
+    # 1. ComfyUI 显存释放
+    try:
+        req = urllib.request.Request(
+            f"http://{SERVER_ADDRESS}/free",
+            data=json.dumps({"unload_models": True, "free_memory": True}).encode('utf-8'),
+            headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            results.append("ComfyUI 模型显存已释放")
+    except Exception as e:
+        results.append(f"ComfyUI 释放提示: {e}")
+
+    # 2. LM Studio 模型卸载
+    try:
+        import subprocess
+        p = subprocess.run(["lms", "unload", "--all"], capture_output=True, text=True, timeout=5)
+        if p.returncode == 0:
+            results.append("LM Studio 模型已卸载")
+        else:
+            # 备选调用 API
+            req = urllib.request.Request(
+                "http://127.0.0.1:1234/api/v1/models/unload",
+                data=b"{}",
+                headers={"Content-Type": "application/json"}
+            )
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                pass
+            results.append("LM Studio 模型已卸载 (API)")
+    except Exception as e:
+        results.append(f"LM Studio 卸载异常: {e}")
+
+    return " | ".join(results)
+
+_last_batch_node17_inputs = None
+
+def execute_generation_task(user_prompt, msg_queue, is_batch_continuation=False):
     """
     后台执行单个生成任务。
     严格维持现有节点 17 (LM Studio) 和采样器种子随机机制，
     同时统计耗时并回传图片元数据。
+    若 is_batch_continuation=True，则复用当前批次首次扩写的提示词输入，不破坏 Node 17 缓存。
     """
+    global _last_batch_node17_inputs
     start_time = time.time()
     try:
         # 1. 读取工作流配置
         with open(WORKFLOW_FILE, "r", encoding="utf-8") as f:
             prompt_workflow = json.load(f)
         
-        # 2. 动态注入 prompt 与打破缓存
+        # 2. 动态注入 prompt 与缓存管理
         if "17" in prompt_workflow:
-            prompt_workflow["17"]["inputs"]["user_message"] = user_prompt
-            if "temperature" in prompt_workflow["17"]["inputs"]:
-                base_temp = prompt_workflow["17"]["inputs"]["temperature"]
-                prompt_workflow["17"]["inputs"]["temperature"] = round(base_temp + random.uniform(-0.0050, 0.0050), 4)
+            if is_batch_continuation and _last_batch_node17_inputs is not None:
+                # 保持与首张完全相同的 Node 17 输入，直接命中 ComfyUI 节点执行缓存，避免重复调用 LM Studio
+                prompt_workflow["17"]["inputs"] = dict(_last_batch_node17_inputs)
+                msg_queue.put(("status", "复用批次扩写提示词，生图模型极速连画..."))
             else:
-                prompt_workflow["17"]["inputs"]["user_message"] += f"\n<!-- Bypass Cache: {random.randint(1, 1000000)} -->"
+                prompt_workflow["17"]["inputs"]["user_message"] = user_prompt
+                if "temperature" in prompt_workflow["17"]["inputs"]:
+                    base_temp = prompt_workflow["17"]["inputs"]["temperature"]
+                    prompt_workflow["17"]["inputs"]["temperature"] = round(base_temp + random.uniform(-0.0050, 0.0050), 4)
+                else:
+                    prompt_workflow["17"]["inputs"]["user_message"] += f"\n<!-- Bypass Cache: {random.randint(1, 1000000)} -->"
+                _last_batch_node17_inputs = dict(prompt_workflow["17"]["inputs"])
 
-        # 随机化采样种子
+        # 随机化采样种子（每张图片独立随机）
         if "5" in prompt_workflow and "inputs" in prompt_workflow["5"]:
             prompt_workflow["5"]["inputs"]["seed"] = random.randint(1, 10**15)
         if "12" in prompt_workflow and "inputs" in prompt_workflow["12"]:

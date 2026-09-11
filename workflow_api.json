@@ -226,7 +226,9 @@
       "max_tokens": 4096,
       "thinking_tokens": true,
       "use_sdk": true,
-      "debug": false
+      "debug": false,
+      "auto_eject": true,
+      "unload_comfy_before": true
     },
     "class_type": "LMStudioNode",
     "_meta": {

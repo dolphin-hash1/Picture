@@ -12,7 +12,7 @@ from ui.prompt_library_modal import PromptLibraryModal
 from ui.image_preview_modal import ImagePreviewModal
 from ui.gallery_card import GalleryCard
 from core.config import OUTPUT_DIR, ensure_dirs
-from core.client import execute_generation_task, decrypt_image_data
+from core.client import execute_generation_task, decrypt_image_data, free_vram
 
 class ComfyUIApp(ctk.CTk):
     def __init__(self):
@@ -184,7 +184,20 @@ class ComfyUIApp(ctk.CTk):
             hover_color=Theme.PRIMARY_HOVER,
             corner_radius=Theme.RADIUS_MD
         )
-        self.generate_button.pack(fill="x", padx=20, pady=(0, 20))
+        self.generate_button.pack(fill="x", padx=20, pady=(0, 10))
+
+        # 5.1 显存释放快捷按钮
+        self.free_vram_btn = ctk.CTkButton(
+            self.sidebar_frame,
+            text="🧹 清空显存 (Free VRAM)",
+            command=self.manual_free_vram,
+            height=32,
+            font=Theme.font_caption(),
+            fg_color=Theme.SECONDARY_BTN,
+            hover_color=Theme.SECONDARY_BTN_HOVER,
+            corner_radius=Theme.RADIUS_SM
+        )
+        self.free_vram_btn.pack(fill="x", padx=20, pady=(0, 16))
 
         # 6. 底部状态与进度区
         status_box = ctk.CTkFrame(
@@ -527,6 +540,14 @@ class ComfyUIApp(ctk.CTk):
 
     # ================= 任务生成流程调度 =================
 
+    def manual_free_vram(self):
+        """手动清空 ComfyUI 与 LM Studio 显存占用"""
+        self.status_label.configure(text="⏳ 正在清空显存...", text_color=Theme.INFO)
+        def _free_worker():
+            res = free_vram()
+            self.msg_queue.put(("status", f"🧹 显存已释放 ({res})"))
+        threading.Thread(target=_free_worker, daemon=True).start()
+
     def start_generation(self):
         user_prompt = self.prompt_textbox.get("0.0", "end").strip()
         if not user_prompt:
@@ -539,8 +560,9 @@ class ComfyUIApp(ctk.CTk):
         except ValueError:
             count = 1
 
-        for _ in range(count):
-            self.task_queue.put(user_prompt)
+        for i in range(count):
+            # 第一张正常触发 LLM 扩写，同批后续图片复用扩写词直接生图
+            self.task_queue.put((user_prompt, i > 0))
 
         if self.is_generating:
             self.msg_queue.put(("update_queue_status", ""))
@@ -552,12 +574,17 @@ class ComfyUIApp(ctk.CTk):
 
     def job_worker_thread(self):
         while not self.task_queue.empty():
-            current_prompt = self.task_queue.get()
+            task_item = self.task_queue.get()
+            if isinstance(task_item, tuple):
+                current_prompt, is_continuation = task_item
+            else:
+                current_prompt, is_continuation = task_item, False
+
             self.msg_queue.put(("update_queue_status", ""))
             self.msg_queue.put(("progress", 0))
 
             try:
-                execute_generation_task(current_prompt, self.msg_queue)
+                execute_generation_task(current_prompt, self.msg_queue, is_batch_continuation=is_continuation)
             except Exception:
                 # 异常信息已通过 msg_queue 上报
                 pass
